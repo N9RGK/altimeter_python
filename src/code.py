@@ -144,7 +144,7 @@ while logging == True:
         except Exception as e:
             logging = False
 
-    if mission_time > 30:
+    if mission_time > 28:
         logging = False
 
 print("saving the data")
@@ -162,8 +162,8 @@ led.value = False  # Turn off LED to indicate logging is complete
 
 
 print("Finished")
-while True:
-    led.value = True
-    time.sleep(0.5)
-    led.value = False
-    time.sleep(0.5)
+#while True:
+#    led.value = True
+#    time.sleep(0.5)
+#    led.value = False
+#    time.sleep(0.5)
