@@ -42,9 +42,9 @@ fire1.switch_to_output(value=False)
 fire2 = DigitalInOut(fire2_pin)
 fire2.switch_to_output(value=False)
 
+#Setup the pressure sensor
 i2c = busio.I2C(scl0_pin, sda0_pin)
 bmp280 = adafruit_bmp280.Adafruit_BMP280_I2C(i2c, 0x77)
-
 bmp280.sea_level_pressure = 1013.25
 bmp280.mode = adafruit_bmp280.MODE_NORMAL
 bmp280.standby_period = adafruit_bmp280.STANDBY_TC_500
@@ -52,24 +52,10 @@ bmp280.iir_filter = adafruit_bmp280.IIR_FILTER_X16
 bmp280.overscan_pressure = adafruit_bmp280.OVERSCAN_X16
 bmp280.overscan_temperature = adafruit_bmp280.OVERSCAN_X2
 
-time.sleep(2)
-
-altitude = (
-    bmp280.altitude * 3.28084
-)  # initialize altitude to current measurement and convert to feet
-
-launchSiteAltitude = (
-    altitude  # set launch site altitude to start athte current measurement
-)
+#configure voice interface to feather
+uart = busio.UART(board.GP0, board.GP1, baudrate=115200)
 
 filename = "data.csv"
-
-agl = 0
-newAltitude = bmp280.altitude * 3.28084
-agl = newAltitude - altitude
-waitToLog = 15
-
-usb_status = supervisor.runtime.serial_connected
 
 # Setup LED
 led_pin = board.GP25
@@ -77,10 +63,18 @@ led = DigitalInOut(led_pin)
 led.switch_to_output()
 
 
+# accepts hecaPascals and returns feet
+def makeAltitude(p) -> float:
+    # use the sea level and 15C to compute the current altitude
+    seaLevelPressure = 1013.25
+    temperature = 15.0 + 273.15
+    altitude = ((((seaLevelPressure / p) ** (1 / 5.257)) - 1) * temperature) / 0.0065
+    return altitude * 3.28084
+
+
 # simple function to test if a file is present
 def exists(f):
     os.sync()
-    print(os.listdir("/"))
     if f in os.listdir("/"):
         print("found " + f)
         return True
@@ -90,6 +84,9 @@ def exists(f):
 
 if exists(filename):
     print("Standing by for file transfer. To fly and log, remove USB cable.")
+    uart.write(b'altimeter\n')
+    uart.write(b'on\n')
+    uart.write(b'ground\n')
     while True:
         led.value = True
         time.sleep(0.1)
@@ -97,73 +94,109 @@ if exists(filename):
         time.sleep(0.1)
 
 loopTime = 0
-
-print("Starting Ground Phase")
-while loopTime < waitToLog:
-    newAltitude = bmp280.altitude * 3.28084
-    launchSiteAltitude = newAltitude
-    agl = newAltitude - launchSiteAltitude
-    deltaAlt = newAltitude - altitude
-    altitude = newAltitude
-    print(loopTime, ", ", agl, ", ", usb_status, ", Waiting to log")
-    loopTime = loopTime + 1
-    led.value = True
-    time.sleep(0.25)
-    led.value = False
-    time.sleep(0.25)
-    time.sleep(0.1)
-
-# open the file
-# capture the time of the launch so we can subtract
-launchTime = supervisor.ticks_ms()
-print("Launch Time Set To: ", launchTime / 1000)
-logging = True
-
-previous_sample_time = 0
+talkTicks = 0
 
 led.value = True  # turn on LED solid for the durration of the logging
 
 gc.collect()  # garbage collect the memory
-print(gc.mem_free())
 
+history = 20
+
+ramLimit = False
+flying = False
+logging = True
+launchTime = 0
+# 200 data points to seed the pressure sum
 mission_data = []
-print(len(mission_data))
+for i in range(0, history):
+    mission_data.append(bmp280.pressure)
+startTime = time.monotonic_ns()
+armed = False
+previousSample = 0
+while logging:
+    now = time.monotonic_ns()
+    if now - previousSample > 50000000:
+        previousSample = now
 
-print("flying")
-while logging == True:
-    mission_time = (supervisor.ticks_ms() - launchTime) / 1000
-
-    if mission_time - previous_sample_time > 0.050:  # sample every 50ms
-        previous_sample_time = mission_time
-        newAltitude = bmp280.altitude * 3.28084
-        pressure = bmp280.pressure
-        agl = newAltitude - launchSiteAltitude
-        altitude = newAltitude
         try:
-            mission_data.append((mission_time, agl, pressure))
+            mission_data.append(bmp280.pressure)
         except Exception as e:
+            ramLimit = True
             logging = False
 
-    if mission_time > 28:
-        logging = False
+        avgAltitude = makeAltitude(sum(mission_data[-history:]) / history)
+        altitude = makeAltitude(sum(mission_data[-3:]) / 3)
 
+        if not flying:
+            mission_data.pop(0)
+            launchTime = (
+                now  # keep updating the launchTime.  This will stop when we are saving.
+            )
+            # sit on the pad for 10 seconds
+            if not armed:
+                if (now - startTime) > 10000000000:
+                    print("armed")
+                    armed = True
+            else:
+                # launch detector
+                if abs(altitude - avgAltitude) > 10:
+                    launchTime = now
+                    print("Launch")
+                    print("Altitude : " + str(altitude))
+                    print("avgAltitude : " + str(avgAltitude))
+                    print("Launch Time Set To: ", launchTime)
+                    flying = True
+                    uart.write(b'launch\n')
+        else:
+            if(now - talkTicks > 6000): #  talk every 6 seconds
+                talkTicks = now
+                print(mission_time)
+                print("Sending Altitude to Feather")
+                altitudeStatement = "altitude %d" % (altitude)
+                uart.write(bytes(altitudeStatement, 'ascii'))
+            
+            # landing detector
+            print(altitude, avgAltitude, abs(altitude - avgAltitude))
+            if abs(altitude - avgAltitude) < 1.0:
+                logging = False
+
+            # maximum flight detector 10 minutes
+            if now - launchTime > 600000000000:
+                logging = False
+
+
+flying = False
+mission_time = (now - launchTime) / 1000000000
+if len(mission_data):
+    dT = mission_time / len(mission_data)
+else:
+    dT = 0.05
+
+print(".")
+print("landed")
+uart.write(b'landing\n')
+print("Altitude : " + str(altitude))
+print("avgAltitude : " + str(avgAltitude))
+print("mission elapsed time : " + str(mission_time))
 print("saving the data")
 file = open(filename, "wt")
 print("Log File Created")
+file.write("mission time = " + str(mission_time) + "\n")
+file.write("dt," + str(dT) + "\n")
+count = 0
 for d in mission_data:
-    data_string = str(d[0]) + "," + str(d[1]) + "," + str(d[2])
-    print("saving: " + data_string)
-    file.write(data_string + "\n")
+    file.write(str(count) + "," + str(d) + "\n")
+    count += 1
+file.flush()
 file.close()
-time.sleep(1)
 os.sync()
 
 led.value = False  # Turn off LED to indicate logging is complete
 
 
 print("Finished")
-#while True:
-#    led.value = True
-#    time.sleep(0.5)
-#    led.value = False
-#    time.sleep(0.5)
+while True:
+    led.value = True
+    time.sleep(0.5)
+    led.value = False
+    time.sleep(0.5)
