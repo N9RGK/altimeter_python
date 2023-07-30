@@ -137,6 +137,8 @@ while logging:
                 if (now - startTime) > 10000000000:
                     print("armed")
                     armed = True
+                    uart.write(b'callsign\n')
+
             else:
                 # launch detector
                 if abs(altitude - avgAltitude) > 10:
